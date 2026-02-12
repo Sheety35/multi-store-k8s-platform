@@ -1,0 +1,26 @@
+wordpress:
+  image:
+    tag: latest
+  wordpressUsername: admin
+  wordpressPassword: admin123
+  wordpressEmail: admin@example.com
+  persistence:
+    enabled: true
+    storageClass: local-path
+    accessModes:
+      - ReadWriteOnce
+    size: 8Gi
+
+  service:
+    type: ClusterIP
+
+  mariadb:
+    image:
+      tag: latest
+    auth:
+      rootPassword: rootpass123
+      password: wordpresspass123
+
+ingress:
+  enabled: true
+  host: store.localhost
