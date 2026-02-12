@@ -20,6 +20,17 @@ wordpress:
     auth:
       rootPassword: rootpass123
       password: wordpresspass123
+    
+  extraVolumes:
+    - name: plugin-script
+      configMap:
+        name: plugin-install-script
+        defaultMode: 0777
+
+  extraVolumeMounts:
+    - name: plugin-script
+      mountPath: /docker-entrypoint-init.d/install-woocommerce.sh
+      subPath: install-woocommerce.sh
 
 ingress:
   enabled: true
