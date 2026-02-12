@@ -306,7 +306,7 @@ async function validateRateLimit(tenantId) {
         }
 
         // Check time-based rate limit
-        const oneHourAgo = new Date(Date.now() - 0 * 60 * 1000);
+        const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
         const [rateResult] = await pool.execute(
             "SELECT COUNT(*) as count FROM rate_limits WHERE tenant_id = ? AND created_at > ?",
             [tenantId, oneHourAgo]
