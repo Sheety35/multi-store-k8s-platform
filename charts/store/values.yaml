@@ -4,6 +4,10 @@ wordpress:
   wordpressUsername: admin
   wordpressPassword: admin123
   wordpressEmail: admin@example.com
+  
+  extraEnvVars:
+    - name: STORE_ID
+      value: "{{ .Release.Name }}"
   persistence:
     enabled: true
     storageClass: local-path

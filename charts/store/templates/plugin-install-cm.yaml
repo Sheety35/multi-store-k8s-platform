@@ -25,3 +25,18 @@ data:
         wp theme install storefront --activate
         echo "Storefront theme installed."
     fi
+
+    # Create Webhook for Product Creation
+    # We use 'host.docker.internal' to reach the host machine from the pod (assuming Docker Desktop)
+    # The webhook will fire when a product is created
+    echo "Configuring webhook..."
+    
+    API_URL="http://host.docker.internal:3000/webhooks/audit?store_id=${STORE_ID}&action=product.created&secret=mysecret"
+    
+    # Check if webhook exists (simple check to avoid duplicates on restart)
+    if ! wp wc webhook list --user=1 --porcelain | grep -q .; then
+        wp wc webhook create --topic=product.created --delivery_url="$API_URL" --user=1 --status=active
+        echo "Webhook created."
+    else
+        echo "Webhook already exists."
+    fi

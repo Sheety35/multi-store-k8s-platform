@@ -93,6 +93,14 @@ async function initDatabase() {
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
         `);
 
+        // Add name column if it doesn't exist (for migration)
+        try {
+            await connection.query("ALTER TABLE stores ADD COLUMN name VARCHAR(255) AFTER id");
+        } catch (err) {
+            // Ignore error if column already exists (Error 1060: Duplicate column name)
+            if (err.errno !== 1060) throw err;
+        }
+
         console.log("Database schema initialized");
     } finally {
         connection.release();
@@ -372,16 +380,33 @@ app.post("/stores", async (req, res) => {
             return res.status(429).json(response);
         }
 
-        const storeId = `store-${uuidv4().slice(0, 8)}`;
+        let storeId;
+        const { name } = req.body;
+
+        if (name) {
+            // Sanitize name for ID (lowercase, alphanumeric, hyphens only)
+            const sanitized = name.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+
+            if (sanitized) {
+                // Append short UUID (5 chars) to ensure uniqueness
+                storeId = `${sanitized}-${uuidv4().slice(0, 5)}`;
+            } else {
+                storeId = `store-${uuidv4().slice(0, 8)}`;
+            }
+        } else {
+            storeId = `store-${uuidv4().slice(0, 8)}`;
+        }
+
         const namespace = storeId;
         const host = `${storeId}.127.0.0.1.nip.io`;
         const now = new Date();
+        const displayName = name || storeId;
 
         // Insert store
         await connection.execute(
-            `INSERT INTO stores (id, tenant_id, namespace, host, status, created_at, provisioning_started_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            [storeId, tenantId, namespace, host, 'Provisioning', now, now]
+            `INSERT INTO stores (id, name, tenant_id, namespace, host, status, created_at, provisioning_started_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            [storeId, displayName, tenantId, namespace, host, 'Provisioning', now, now]
         );
 
         // Record idempotency key
@@ -400,6 +425,7 @@ app.post("/stores", async (req, res) => {
 
         const store = {
             id: storeId,
+            name: displayName,
             tenant_id: tenantId,
             namespace,
             host,
@@ -411,7 +437,7 @@ app.post("/stores", async (req, res) => {
         res.status(202).json(store);
 
         // Audit Log
-        logAudit(tenantId, 'CREATE_STORE', 'STORE', storeId, 'INITIATED', { host, namespace }, req.ip);
+        logAudit(tenantId, 'CREATE_STORE', 'STORE', storeId, 'INITIATED', { host, namespace, name: displayName }, req.ip);
 
         // Async provisioning
         (async () => {
@@ -536,7 +562,7 @@ app.delete("/stores/:id", async (req, res) => {
         res.json({ message: "Store deletion initiated", store: { ...store, status: 'Deleting' } });
 
         // Audit Log
-        logAudit(tenantId, 'DELETE_STORE', 'STORE', storeId, 'INITIATED', {}, req.ip);
+        logAudit(tenantId, 'DELETE_STORE', 'STORE', storeId, 'INITIATED', { name: store.name }, req.ip);
 
         // Async deletion
         (async () => {
@@ -576,6 +602,49 @@ app.get("/health", async (req, res) => {
     } catch (error) {
         res.status(503).json({ status: "unhealthy", database: "disconnected" });
     }
+});
+
+// Webhook for Audit Logs (e.g. from WooCommerce)
+app.post("/webhooks/audit", async (req, res) => {
+    const { store_id, action, secret } = req.query;
+    const body = req.body;
+
+    // In a real app, verify 'secret' to ensure it comes from a trusted store
+
+    let details = {};
+    let resourceType = 'UNKNOWN';
+    let resourceId = 'UNKNOWN';
+
+    // Handle WooCommerce specific payloads
+    if (action === 'product.created') {
+        resourceType = 'PRODUCT';
+        resourceId = body.id || 'unknown';
+        details = {
+            name: body.name,
+            price: body.regular_price,
+            sku: body.sku,
+            permalink: body.permalink
+        };
+    } else {
+        details = body;
+    }
+
+    // Default tenant for now since webhooks might not carry headers
+    // In production, you'd look up the tenant_id based on the store_id
+    const tenantId = 'default';
+
+    await logAudit(
+        tenantId,
+        action.toUpperCase().replace('.', '_'),
+        resourceType,
+        resourceId,
+        'COMPLETED',
+        details,
+        req.ip
+    );
+
+    console.log(`[Audit Webhook] Message received for store ${store_id}: ${action}`);
+    res.status(200).send('OK');
 });
 
 // Initialize and start server

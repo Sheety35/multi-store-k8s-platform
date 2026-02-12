@@ -35,7 +35,8 @@ function renderStores() {
         <div class="store-card">
             <div class="store-header">
                 <div>
-                    <div class="store-id">${store.id}</div>
+                    <div class="store-id">${store.name || store.id}</div>
+                    <div style="font-size: 0.8rem; color: #666; margin-bottom: 4px;">ID: ${store.id}</div>
                     <a href="http://${store.host}" target="_blank" class="store-host">${store.host} ↗</a>
                 </div>
                 <span class="status-badge ${getStatusClass(store.status)}">${store.status}</span>
@@ -105,13 +106,16 @@ async function provisionStore() {
         provisionBtn.disabled = true;
         provisionBtn.textContent = 'Provisioning...';
 
+        const storeNameInput = document.getElementById('store-name');
+        const name = storeNameInput ? storeNameInput.value.trim() : '';
+
         const res = await fetch(`${API_URL}/stores`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
                 'Idempotency-Key': crypto.randomUUID()
             },
-            body: JSON.stringify({}) // Add extra options here if needed
+            body: JSON.stringify({ name })
         });
 
         if (!res.ok) {
@@ -121,6 +125,7 @@ async function provisionStore() {
 
         const newStore = await res.json();
         showToast(`Store ${newStore.id} provisioning started`);
+        if (storeNameInput) storeNameInput.value = '';
         fetchStores(); // Refresh list immediately
 
     } catch (error) {
