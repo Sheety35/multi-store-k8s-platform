@@ -43,6 +43,14 @@ function renderStores() {
             
             <div class="store-details">
                 <div class="detail-row">
+                    <span>Admin URL:</span>
+                    <a href="http://${store.host}/wp-admin" target="_blank">/wp-admin</a>
+                </div>
+                <div class="detail-row">
+                    <span>Credentials:</span>
+                    <span title="Default credentials">admin / admin123</span>
+                </div>
+                <div class="detail-row">
                     <span>Created:</span>
                     <span>${formatDate(store.created_at)}</span>
                 </div>
@@ -61,6 +69,11 @@ function renderStores() {
             </div>
 
             <div class="store-actions">
+                ${store.status === 'Ready' ? `
+                    <a href="http://${store.host}/wp-admin" target="_blank" class="btn btn-primary" style="margin-right: 10px; text-decoration: none;">
+                        Manage Store
+                    </a>
+                ` : ''}
                 ${store.status !== 'Deleted' && store.status !== 'Deleting' ? `
                     <button class="btn btn-danger" onclick="deleteStore('${store.id}')">
                         Delete Store
@@ -95,7 +108,8 @@ async function provisionStore() {
         const res = await fetch(`${API_URL}/stores`, {
             method: 'POST',
             headers: {
-                'Content-Type': 'application/json'
+                'Content-Type': 'application/json',
+                'Idempotency-Key': crypto.randomUUID()
             },
             body: JSON.stringify({}) // Add extra options here if needed
         });

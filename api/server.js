@@ -77,6 +77,22 @@ async function initDatabase() {
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
         `);
 
+        await connection.query(`
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                tenant_id VARCHAR(255) NOT NULL,
+                action VARCHAR(50) NOT NULL,
+                resource_type VARCHAR(50) NOT NULL,
+                resource_id VARCHAR(255) NOT NULL,
+                status VARCHAR(50) NOT NULL,
+                details TEXT,
+                ip_address VARCHAR(45),
+                created_at DATETIME(3) NOT NULL,
+                INDEX idx_tenant_created (tenant_id, created_at),
+                INDEX idx_resource (resource_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        `);
+
         console.log("Database schema initialized");
     } finally {
         connection.release();
@@ -108,9 +124,30 @@ function getTenantId(req) {
 }
 
 function generateIdempotencyKey(req) {
-    const tenantId = getTenantId(req);
-    const requestData = JSON.stringify(req.body || {});
-    return crypto.createHash('sha256').update(`${tenantId}:${requestData}`).digest('hex');
+    // If no key is provided, assume it's a new request and generate a random one
+    return uuidv4();
+}
+
+async function logAudit(tenantId, action, resourceType, resourceId, status, details = {}, ip = null) {
+    try {
+        await pool.execute(
+            `INSERT INTO audit_logs 
+            (tenant_id, action, resource_type, resource_id, status, details, ip_address, created_at) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+                tenantId,
+                action,
+                resourceType,
+                resourceId,
+                status,
+                JSON.stringify(details),
+                ip,
+                new Date()
+            ]
+        );
+    } catch (error) {
+        console.error("Audit logging failed:", error);
+    }
 }
 
 // Readiness checks (keep your existing functions)
@@ -373,6 +410,9 @@ app.post("/stores", async (req, res) => {
 
         res.status(202).json(store);
 
+        // Audit Log
+        logAudit(tenantId, 'CREATE_STORE', 'STORE', storeId, 'INITIATED', { host, namespace }, req.ip);
+
         // Async provisioning
         (async () => {
             try {
@@ -423,7 +463,7 @@ app.get("/stores", async (req, res) => {
 
     try {
         const [rows] = await pool.execute(
-            "SELECT * FROM stores WHERE tenant_id = ? ORDER BY created_at DESC",
+            "SELECT * FROM stores WHERE tenant_id = ? AND status != 'Deleted' ORDER BY created_at DESC",
             [tenantId]
         );
         res.json(rows);
@@ -495,10 +535,14 @@ app.delete("/stores/:id", async (req, res) => {
 
         res.json({ message: "Store deletion initiated", store: { ...store, status: 'Deleting' } });
 
+        // Audit Log
+        logAudit(tenantId, 'DELETE_STORE', 'STORE', storeId, 'INITIATED', {}, req.ip);
+
         // Async deletion
         (async () => {
             try {
-                const command = `helm uninstall ${storeId} -n ${storeId} && kubectl delete namespace ${storeId}`;
+                // Try helm uninstall, but ensure namespace is deleted regardless
+                const command = `helm uninstall ${storeId} -n ${storeId} || true && kubectl delete namespace ${storeId} --wait=false`;
                 const { stdout } = await execAsync(command);
                 console.log(`[${storeId}] Deleted successfully:`, stdout);
 
