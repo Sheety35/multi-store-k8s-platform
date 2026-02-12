@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+
+# Environment variables
+.env
+
+# Terraform/Kubernetes local files
+kubeconfig-*.yaml
+*.tfstate
+*.tfstate.backup
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS generated files
+.DS_Store
+Thumbs.db
