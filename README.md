@@ -22,6 +22,56 @@ A robust, Kubernetes-native platform for provisioning and orchestrating multiple
 
 ## 🏗️ Architecture
 
+```mermaid
+graph TD
+    subgraph "External"
+        User[User / Admin]
+        Webhook[WooCommerce Webhook]
+    end
+
+    subgraph "Kubernetes Cluster"
+        Ingress[Ingress Controller]
+        
+        subgraph "Control Plane Namespace"
+            Orchestrator[Node.js Orchestrator API]
+            Dashboard[Dashboard UI]
+            CP_DB[(MariaDB Control Plane)]
+        end
+
+        subgraph "Tenant: Store A"
+            WP_A[WordPress Pod]
+            DB_A[(MariaDB Pod)]
+            PVC_A[PVC Storage]
+        end
+
+        subgraph "Tenant: Store B"
+            WP_B[WordPress Pod]
+            DB_B[(MariaDB Pod)]
+            PVC_B[PVC Storage]
+        end
+    end
+
+    %% Flows
+    User -->|HTTP/HTTPS| Ingress
+    Ingress -->|Provisions Stores| Orchestrator
+    Orchestrator -->|Helms Install| WP_A
+    Orchestrator -->|Helms Install| WP_B
+    Orchestrator -->|Stores Metadata| CP_DB
+
+    Ingress -->|Visits Store| WP_A
+    WP_A -->|Product Update| Webhook
+    Webhook -->|Audit Log| Orchestrator
+
+    %% Connections
+    WP_A --> DB_A
+    DB_A --> PVC_A
+    WP_B --> DB_B
+    DB_B --> PVC_B
+
+    classDef distinct fill:#f96,stroke:#333,stroke-width:2px;
+    class Orchestrator,CP_DB distinct;
+```
+
 1.  **Dashboard**: A lightweight UI (HTML/JS) for managing stores.
 2.  **Orchestrator (API)**: Node.js service that talks to the Kubernetes API and Helm to manage resources.
 3.  **Control Plane DB**: A shared MariaDB instance storing tenant metadata and audit logs.
