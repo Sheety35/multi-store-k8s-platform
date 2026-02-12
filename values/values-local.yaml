@@ -1,0 +1,31 @@
+# LOCAL environment values
+wordpress:
+  wordpressUsername: admin
+  wordpressPassword: admin123  
+  wordpressEmail: admin@test.com
+  
+  persistence:
+    enabled: true
+    storageClass: "local-path" # Perfect for K3s/Minikube/Docker Desktop
+    accessModes:
+      - ReadWriteOnce
+    size: 5Gi
+  
+  service:
+    type: ClusterIP # We use Ingress to expose
+
+  mariadb:
+    auth:
+      rootPassword: rootpass  # Simple password for dev
+      password: wppass
+    primary:
+      persistence:
+        storageClass: "local-path"
+        size: 5Gi
+
+ingress:
+  enabled: true
+  className: "nginx"
+  # In LOCAL we often use .localhost or .nip.io
+  annotations:
+    kubernetes.io/ingress.class: nginx

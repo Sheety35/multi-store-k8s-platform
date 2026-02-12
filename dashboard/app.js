@@ -49,7 +49,7 @@ function renderStores() {
                 </div>
                 <div class="detail-row">
                     <span>Credentials:</span>
-                    <span title="Default credentials">admin / admin123</span>
+                    <span title="Click to copy" style="font-family: monospace; background: #ddd; padding: 2px 4px; border-radius: 4px;">admin / ${store.wp_password || 'admin123'}</span>
                 </div>
                 <div class="detail-row">
                     <span>Created:</span>

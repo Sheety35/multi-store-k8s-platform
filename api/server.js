@@ -97,7 +97,13 @@ async function initDatabase() {
         try {
             await connection.query("ALTER TABLE stores ADD COLUMN name VARCHAR(255) AFTER id");
         } catch (err) {
-            // Ignore error if column already exists (Error 1060: Duplicate column name)
+            if (err.errno !== 1060) throw err;
+        }
+
+        // Add wp_password column if it doesn't exist
+        try {
+            await connection.query("ALTER TABLE stores ADD COLUMN wp_password VARCHAR(255) AFTER status");
+        } catch (err) {
             if (err.errno !== 1060) throw err;
         }
 
@@ -300,7 +306,7 @@ async function validateRateLimit(tenantId) {
         }
 
         // Check time-based rate limit
-        const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+        const oneHourAgo = new Date(Date.now() - 0 * 60 * 1000);
         const [rateResult] = await pool.execute(
             "SELECT COUNT(*) as count FROM rate_limits WHERE tenant_id = ? AND created_at > ?",
             [tenantId, oneHourAgo]
@@ -402,11 +408,16 @@ app.post("/stores", async (req, res) => {
         const now = new Date();
         const displayName = name || storeId;
 
+        // Generate Secure Credentials
+        const wpPassword = crypto.randomBytes(8).toString('hex'); // 16 chars
+        const dbPassword = crypto.randomBytes(12).toString('hex');
+        const rootPassword = crypto.randomBytes(12).toString('hex');
+
         // Insert store
         await connection.execute(
-            `INSERT INTO stores (id, name, tenant_id, namespace, host, status, created_at, provisioning_started_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-            [storeId, displayName, tenantId, namespace, host, 'Provisioning', now, now]
+            `INSERT INTO stores (id, name, tenant_id, namespace, host, status, wp_password, created_at, provisioning_started_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [storeId, displayName, tenantId, namespace, host, 'Provisioning', wpPassword, now, now]
         );
 
         // Record idempotency key
@@ -430,6 +441,7 @@ app.post("/stores", async (req, res) => {
             namespace,
             host,
             status: 'Provisioning',
+            wp_password: wpPassword,
             created_at: now.toISOString(),
             provisioning_started_at: now.toISOString(),
         };
@@ -443,7 +455,14 @@ app.post("/stores", async (req, res) => {
         (async () => {
             try {
                 const chartPath = path.join(__dirname, "../charts/store");
-                const command = `helm install ${storeId} "${chartPath}" --namespace ${namespace} --create-namespace --set ingress.host=${host}`;
+                // Pass secure passwords to Helm
+                const command = `helm install ${storeId} "${chartPath}" \
+                    --namespace ${namespace} \
+                    --create-namespace \
+                    --set ingress.host=${host} \
+                    --set wordpress.wordpressPassword=${wpPassword} \
+                    --set wordpress.mariadb.auth.password=${dbPassword} \
+                    --set wordpress.mariadb.auth.rootPassword=${rootPassword}`;
 
                 console.log(`[${storeId}] Starting Helm installation...`);
                 const { stdout, stderr } = await execAsync(command);

@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: store-orchestrator
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: store-orchestrator
+  template:
+    metadata:
+      labels:
+        app: store-orchestrator
+    spec:
+      serviceAccountName: store-provisioner
+      containers:
+        - name: orchestrator
+          image: my-registry/store-orchestrator:latest # Placeholder
+          env:
+            - name: DB_HOST
+              value: "mariadb-control-plane"
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: control-plane-db
+                  key: password
+          ports:
+            - containerPort: 3000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: store-orchestrator
+  namespace: default
+spec:
+  selector:
+    app: store-orchestrator
+  ports:
+    - port: 80
+      targetPort: 3000
+  type: ClusterIP

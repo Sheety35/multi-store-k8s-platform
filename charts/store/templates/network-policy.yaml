@@ -1,0 +1,25 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "store.fullname" . }}-isolation
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+  
+  # Allow all Egress (for downloading plugins/themes via curl/wget)
+  egress:
+  - {}
+  
+  # Ingress Rules
+  ingress:
+  # 1. Allow traffic between pods in the same namespace (WordPress connecting to MariaDB)
+  - from:
+    - podSelector: {}
+  
+  # 2. Allow incoming traffic for WordPress (from Ingress Controller)
+  - ports:
+    - port: 8080
+    - port: 8443
+    - port: 80

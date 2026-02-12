@@ -1,0 +1,36 @@
+# PROD environment values
+wordpress:
+  wordpressUsername: admin
+  wordpressPassword: admin123  # Ideally this should be secure env var
+  wordpressEmail: admin@example.com
+  
+  persistence:
+    enabled: true
+    storageClass: "gp2" # Or use your cloud storage
+    accessModes:
+      - ReadWriteOnce
+    size: 20Gi
+  
+  service:
+    type: LoadBalancer
+
+  mariadb:
+    auth:
+      rootPassword: rootpass123
+      password: wordpresspass123
+    primary:
+      persistence:
+        storageClass: "gp2"
+        size: 10Gi
+
+ingress:
+  enabled: true
+  className: "nginx"
+  # In PROD you probably use Cert-Manager + external-dns
+  tls:
+    - secretName: store-tls
+      hosts:
+        - store.example.com
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    kubernetes.io/ingress.class: nginx
