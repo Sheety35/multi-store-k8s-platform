@@ -1,55 +1,119 @@
+require('dotenv').config();
 const express = require("express");
 const { v4: uuidv4 } = require("uuid");
+const mysql = require("mysql2/promise");
+const crypto = require("crypto");
 const { exec } = require("child_process");
 const { promisify } = require("util");
 const path = require("path");
-const fs = require("fs").promises;
 
 const execAsync = promisify(exec);
 const app = express();
 app.use(express.json());
+app.use(express.static(path.join(__dirname, '../dashboard')));
+
+// MariaDB connection pool (shared across all API pods)
+const pool = mysql.createPool({
+    host: process.env.DB_HOST || "mariadb-control-plane",
+    port: process.env.DB_PORT || 3306,
+    database: process.env.DB_NAME || "store_control_plane",
+    user: process.env.DB_USER || "root",
+    password: process.env.DB_PASSWORD || "rootpassword",
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0,
+});
 
 // Configuration
 const CONFIG = {
-    STORE_REGISTRY_FILE: path.join(__dirname, "store-registry.json"),
-    MAX_STORES: 100,
-    PROVISIONING_TIMEOUT_MS: 5 * 60 * 1000, // 5 minutes
-    READINESS_CHECK_INTERVAL_MS: 5000, // 5 seconds
-    MAX_READINESS_CHECKS: 60, // 5 minutes max
+    MAX_STORES_GLOBAL: 100,
+    MAX_STORES_PER_TENANT: 10,
+    MAX_STORES_PER_HOUR: 5,
+    PROVISIONING_TIMEOUT_MS: 5 * 60 * 1000,
+    READINESS_CHECK_INTERVAL_MS: 5000,
+    MAX_READINESS_CHECKS: 60,
+    IDEMPOTENCY_WINDOW_MS: 5 * 60 * 1000,
 };
 
-let stores = {};
-
-// 3️⃣ Persistent store registry
-async function loadStoreRegistry() {
+// Initialize database schema
+async function initDatabase() {
+    const connection = await pool.getConnection();
     try {
-        const data = await fs.readFile(CONFIG.STORE_REGISTRY_FILE, "utf8");
-        stores = JSON.parse(data);
-        console.log(`Loaded ${Object.keys(stores).length} stores from registry`);
-    } catch (error) {
-        if (error.code === "ENOENT") {
-            console.log("No existing store registry found, starting fresh");
-            stores = {};
-        } else {
-            console.error("Error loading store registry:", error);
-            stores = {};
-        }
+        await connection.query(`
+            CREATE TABLE IF NOT EXISTS stores (
+                id VARCHAR(255) PRIMARY KEY,
+                tenant_id VARCHAR(255) NOT NULL,
+                namespace VARCHAR(255) NOT NULL,
+                host VARCHAR(255) NOT NULL UNIQUE,
+                status VARCHAR(50) NOT NULL,
+                failure_reason TEXT,
+                created_at DATETIME(3) NOT NULL,
+                provisioning_started_at DATETIME(3),
+                ready_at DATETIME(3),
+                deletion_started_at DATETIME(3),
+                deleted_at DATETIME(3),
+                INDEX idx_tenant_id (tenant_id),
+                INDEX idx_status (status),
+                INDEX idx_created_at (created_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        `);
+
+        await connection.query(`
+            CREATE TABLE IF NOT EXISTS idempotency_keys (
+                \`key\` VARCHAR(255) PRIMARY KEY,
+                store_id VARCHAR(255) NOT NULL,
+                created_at DATETIME(3) NOT NULL,
+                INDEX idx_created_at (created_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        `);
+
+        await connection.query(`
+            CREATE TABLE IF NOT EXISTS rate_limits (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                tenant_id VARCHAR(255) NOT NULL,
+                store_id VARCHAR(255) NOT NULL,
+                created_at DATETIME(3) NOT NULL,
+                INDEX idx_tenant_created (tenant_id, created_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        `);
+
+        console.log("Database schema initialized");
+    } finally {
+        connection.release();
     }
 }
 
-async function saveStoreRegistry() {
+// Clean up old data
+async function cleanupOldData() {
     try {
-        await fs.writeFile(
-            CONFIG.STORE_REGISTRY_FILE,
-            JSON.stringify(stores, null, 2),
-            "utf8"
+        const idempotencyCutoff = new Date(Date.now() - CONFIG.IDEMPOTENCY_WINDOW_MS);
+        const rateLimitCutoff = new Date(Date.now() - 60 * 60 * 1000);
+
+        await pool.execute(
+            "DELETE FROM idempotency_keys WHERE created_at < ?",
+            [idempotencyCutoff]
+        );
+        await pool.execute(
+            "DELETE FROM rate_limits WHERE created_at < ?",
+            [rateLimitCutoff]
         );
     } catch (error) {
-        console.error("Error saving store registry:", error);
+        console.error("Cleanup error:", error);
     }
 }
 
-// 1️⃣ Real readiness detection
+// Helper functions
+function getTenantId(req) {
+    return req.headers['x-tenant-id'] || req.headers['x-user-id'] || 'default';
+}
+
+function generateIdempotencyKey(req) {
+    const tenantId = getTenantId(req);
+    const requestData = JSON.stringify(req.body || {});
+    return crypto.createHash('sha256').update(`${tenantId}:${requestData}`).digest('hex');
+}
+
+// Readiness checks (keep your existing functions)
 async function checkPodReadiness(namespace) {
     try {
         const { stdout } = await execAsync(
@@ -124,7 +188,6 @@ async function waitForStoreReadiness(storeId, namespace, host) {
         const checkInterval = setInterval(async () => {
             attempts++;
 
-            // 5️⃣ Provisioning timeout
             if (Date.now() - startTime > CONFIG.PROVISIONING_TIMEOUT_MS) {
                 clearInterval(checkInterval);
                 resolve({
@@ -165,177 +228,323 @@ async function waitForStoreReadiness(storeId, namespace, host) {
     });
 }
 
-// 6️⃣ Basic guardrails
-function validateStoreCreation() {
-    const activeStores = Object.values(stores).filter(
-        (s) => s.status !== "Deleted" && s.status !== "Failed"
+// Validation functions
+async function validateRateLimit(tenantId) {
+    try {
+        // Check global limit
+        const [globalResult] = await pool.execute(
+            "SELECT COUNT(*) as count FROM stores WHERE status != 'Deleted'"
+        );
+        if (globalResult[0].count >= CONFIG.MAX_STORES_GLOBAL) {
+            return {
+                valid: false,
+                error: `Global store limit (${CONFIG.MAX_STORES_GLOBAL}) reached`,
+            };
+        }
+
+        // Check per-tenant limit
+        const [tenantResult] = await pool.execute(
+            "SELECT COUNT(*) as count FROM stores WHERE tenant_id = ? AND status != 'Deleted'",
+            [tenantId]
+        );
+        if (tenantResult[0].count >= CONFIG.MAX_STORES_PER_TENANT) {
+            return {
+                valid: false,
+                error: `Tenant store limit (${CONFIG.MAX_STORES_PER_TENANT}) reached`,
+            };
+        }
+
+        // Check time-based rate limit
+        const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+        const [rateResult] = await pool.execute(
+            "SELECT COUNT(*) as count FROM rate_limits WHERE tenant_id = ? AND created_at > ?",
+            [tenantId, oneHourAgo]
+        );
+
+        if (rateResult[0].count >= CONFIG.MAX_STORES_PER_HOUR) {
+            const [oldestResult] = await pool.execute(
+                "SELECT created_at FROM rate_limits WHERE tenant_id = ? AND created_at > ? ORDER BY created_at LIMIT 1",
+                [tenantId, oneHourAgo]
+            );
+            const retryAfter = Math.ceil((oldestResult[0].created_at.getTime() + 60 * 60 * 1000 - Date.now()) / 1000);
+
+            return {
+                valid: false,
+                error: `Rate limit exceeded: max ${CONFIG.MAX_STORES_PER_HOUR} stores per hour`,
+                retryAfter,
+            };
+        }
+
+        return { valid: true };
+    } catch (error) {
+        console.error("Rate limit validation error:", error);
+        return { valid: false, error: "Internal error" };
+    }
+}
+
+async function checkIdempotency(idempotencyKey) {
+    const cutoff = new Date(Date.now() - CONFIG.IDEMPOTENCY_WINDOW_MS);
+    const [rows] = await pool.execute(
+        `SELECT i.store_id, s.* 
+         FROM idempotency_keys i 
+         JOIN stores s ON i.store_id = s.id 
+         WHERE i.key = ? AND i.created_at > ?`,
+        [idempotencyKey, cutoff]
     );
 
-    if (activeStores.length >= CONFIG.MAX_STORES) {
-        return {
-            valid: false,
-            error: `Maximum store limit (${CONFIG.MAX_STORES}) reached`,
-        };
+    if (rows.length === 0) {
+        return { exists: false };
     }
 
-    return { valid: true };
+    return {
+        exists: true,
+        storeId: rows[0].store_id,
+        store: rows[0],
+    };
 }
 
 // Create Store
 app.post("/stores", async (req, res) => {
-    // 6️⃣ Guardrails
-    const validation = validateStoreCreation();
-    if (!validation.valid) {
-        return res.status(429).json({ error: validation.error });
-    }
+    const tenantId = getTenantId(req);
+    const idempotencyKey = req.headers['idempotency-key'] || generateIdempotencyKey(req);
 
-    const storeId = `store-${uuidv4().slice(0, 8)}`;
-    const namespace = storeId;
-    const host = `${storeId}.127.0.0.1.nip.io`;
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
 
-    // 2️⃣ Idempotency - check if store with same characteristics exists
-    const existingStore = Object.values(stores).find(
-        (s) =>
-            s.host === host &&
-            (s.status === "Provisioning" || s.status === "Ready")
-    );
-
-    if (existingStore) {
-        return res.json({
-            ...existingStore,
-            message: "Store already exists or is being provisioned",
-        });
-    }
-
-    stores[storeId] = {
-        id: storeId,
-        namespace,
-        host,
-        status: "Provisioning",
-        createdAt: new Date().toISOString(),
-        failureReason: null, // 4️⃣ Failure reason tracking
-        provisioningStartedAt: new Date().toISOString(),
-    };
-
-    await saveStoreRegistry(); // 3️⃣ Persist immediately
-
-    res.json(stores[storeId]);
-
-    // Async provisioning
-    (async () => {
-        try {
-            const chartPath = path.join(__dirname, "../charts/store");
-            const command = `helm install ${storeId} "${chartPath}" --namespace ${namespace} --create-namespace --set ingress.host=${host}`;
-
-            console.log(`[${storeId}] Starting Helm installation...`);
-            const { stdout, stderr } = await execAsync(command);
-
-            console.log(`[${storeId}] Helm install output:`, stdout);
-            if (stderr) console.log(`[${storeId}] Helm stderr:`, stderr);
-
-            // 1️⃣ Wait for real readiness
-            console.log(`[${storeId}] Waiting for readiness...`);
-            const readinessResult = await waitForStoreReadiness(
-                storeId,
-                namespace,
-                host
-            );
-
-            if (readinessResult.ready) {
-                stores[storeId].status = "Ready";
-                stores[storeId].readyAt = new Date().toISOString();
-                console.log(`[${storeId}] Store is ready!`);
-            } else {
-                stores[storeId].status = "Failed";
-                stores[storeId].failureReason = readinessResult.reason; // 4️⃣
-                console.error(`[${storeId}] Failed: ${readinessResult.reason}`);
-            }
-        } catch (error) {
-            stores[storeId].status = "Failed";
-            stores[storeId].failureReason = error.message; // 4️⃣
-            console.error(`[${storeId}] Provisioning error:`, error.message);
-        } finally {
-            await saveStoreRegistry(); // 3️⃣ Persist final state
+        // Check idempotency
+        const idempotencyCheck = await checkIdempotency(idempotencyKey);
+        if (idempotencyCheck.exists) {
+            await connection.commit();
+            return res.json({
+                ...idempotencyCheck.store,
+                idempotent: true,
+                message: "Store already exists (idempotent request)",
+            });
         }
-    })();
+
+        // Validate rate limits
+        const rateLimitCheck = await validateRateLimit(tenantId);
+        if (!rateLimitCheck.valid) {
+            await connection.commit();
+            const response = { error: rateLimitCheck.error };
+            if (rateLimitCheck.retryAfter) {
+                res.set('Retry-After', rateLimitCheck.retryAfter);
+                response.retryAfter = rateLimitCheck.retryAfter;
+            }
+            return res.status(429).json(response);
+        }
+
+        const storeId = `store-${uuidv4().slice(0, 8)}`;
+        const namespace = storeId;
+        const host = `${storeId}.127.0.0.1.nip.io`;
+        const now = new Date();
+
+        // Insert store
+        await connection.execute(
+            `INSERT INTO stores (id, tenant_id, namespace, host, status, created_at, provisioning_started_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [storeId, tenantId, namespace, host, 'Provisioning', now, now]
+        );
+
+        // Record idempotency key
+        await connection.execute(
+            "INSERT INTO idempotency_keys (`key`, store_id, created_at) VALUES (?, ?, ?)",
+            [idempotencyKey, storeId, now]
+        );
+
+        // Record rate limit
+        await connection.execute(
+            "INSERT INTO rate_limits (tenant_id, store_id, created_at) VALUES (?, ?, ?)",
+            [tenantId, storeId, now]
+        );
+
+        await connection.commit();
+
+        const store = {
+            id: storeId,
+            tenant_id: tenantId,
+            namespace,
+            host,
+            status: 'Provisioning',
+            created_at: now.toISOString(),
+            provisioning_started_at: now.toISOString(),
+        };
+
+        res.status(202).json(store);
+
+        // Async provisioning
+        (async () => {
+            try {
+                const chartPath = path.join(__dirname, "../charts/store");
+                const command = `helm install ${storeId} "${chartPath}" --namespace ${namespace} --create-namespace --set ingress.host=${host}`;
+
+                console.log(`[${storeId}] Starting Helm installation...`);
+                const { stdout, stderr } = await execAsync(command);
+                console.log(`[${storeId}] Helm install output:`, stdout);
+
+                console.log(`[${storeId}] Waiting for readiness...`);
+                const readinessResult = await waitForStoreReadiness(storeId, namespace, host);
+
+                if (readinessResult.ready) {
+                    await pool.execute(
+                        "UPDATE stores SET status = ?, ready_at = ? WHERE id = ?",
+                        ['Ready', new Date(), storeId]
+                    );
+                    console.log(`[${storeId}] Store is ready!`);
+                } else {
+                    await pool.execute(
+                        "UPDATE stores SET status = ?, failure_reason = ? WHERE id = ?",
+                        ['Failed', readinessResult.reason, storeId]
+                    );
+                    console.error(`[${storeId}] Failed: ${readinessResult.reason}`);
+                }
+            } catch (error) {
+                await pool.execute(
+                    "UPDATE stores SET status = ?, failure_reason = ? WHERE id = ?",
+                    ['Failed', error.message, storeId]
+                );
+                console.error(`[${storeId}] Provisioning error:`, error.message);
+            }
+        })();
+
+    } catch (error) {
+        await connection.rollback();
+        console.error("Store creation error:", error);
+        res.status(500).json({ error: "Internal server error" });
+    } finally {
+        connection.release();
+    }
 });
 
 // List Stores
-app.get("/stores", (req, res) => {
-    res.json(Object.values(stores));
+app.get("/stores", async (req, res) => {
+    const tenantId = getTenantId(req);
+
+    try {
+        const [rows] = await pool.execute(
+            "SELECT * FROM stores WHERE tenant_id = ? ORDER BY created_at DESC",
+            [tenantId]
+        );
+        res.json(rows);
+    } catch (error) {
+        console.error("List stores error:", error);
+        res.status(500).json({ error: "Internal server error" });
+    }
 });
 
 // Get Single Store
-app.get("/stores/:id", (req, res) => {
+app.get("/stores/:id", async (req, res) => {
     const storeId = req.params.id;
+    const tenantId = getTenantId(req);
 
-    if (!stores[storeId]) {
-        return res.status(404).json({ error: "Store not found" });
+    try {
+        const [rows] = await pool.execute(
+            "SELECT * FROM stores WHERE id = ? AND tenant_id = ?",
+            [storeId, tenantId]
+        );
+
+        if (rows.length === 0) {
+            return res.status(404).json({ error: "Store not found" });
+        }
+
+        res.json(rows[0]);
+    } catch (error) {
+        console.error("Get store error:", error);
+        res.status(500).json({ error: "Internal server error" });
     }
-
-    res.json(stores[storeId]);
 });
 
 // Delete Store
 app.delete("/stores/:id", async (req, res) => {
     const storeId = req.params.id;
+    const tenantId = getTenantId(req);
 
-    if (!stores[storeId]) {
-        return res.status(404).json({ error: "Store not found" });
-    }
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
 
-    // 2️⃣ Idempotency - already deleted
-    if (stores[storeId].status === "Deleted") {
-        return res.json({
-            message: "Store already deleted",
-            store: stores[storeId],
-        });
-    }
+        const [rows] = await connection.execute(
+            "SELECT * FROM stores WHERE id = ? AND tenant_id = ? FOR UPDATE",
+            [storeId, tenantId]
+        );
 
-    // 2️⃣ Idempotency - already deleting
-    if (stores[storeId].status === "Deleting") {
-        return res.json({
-            message: "Store deletion already in progress",
-            store: stores[storeId],
-        });
-    }
-
-    stores[storeId].status = "Deleting";
-    stores[storeId].deletionStartedAt = new Date().toISOString();
-    await saveStoreRegistry(); // 3️⃣
-
-    res.json({ message: "Store deletion initiated", store: stores[storeId] });
-
-    // Async deletion
-    (async () => {
-        try {
-            const command = `helm uninstall ${storeId} -n ${storeId} && kubectl delete namespace ${storeId}`;
-
-            const { stdout, stderr } = await execAsync(command);
-            console.log(`[${storeId}] Deleted successfully:`, stdout);
-            if (stderr) console.log(`[${storeId}] Delete stderr:`, stderr);
-
-            stores[storeId].status = "Deleted";
-            stores[storeId].deletedAt = new Date().toISOString();
-        } catch (error) {
-            stores[storeId].status = "Failed";
-            stores[storeId].failureReason = `Deletion failed: ${error.message}`; // 4️⃣
-            console.error(`[${storeId}] Deletion error:`, error.message);
-        } finally {
-            await saveStoreRegistry(); // 3️⃣
+        if (rows.length === 0) {
+            await connection.commit();
+            return res.status(404).json({ error: "Store not found" });
         }
-    })();
+
+        const store = rows[0];
+
+        if (store.status === 'Deleted') {
+            await connection.commit();
+            return res.json({ message: "Store already deleted", store });
+        }
+
+        if (store.status === 'Deleting') {
+            await connection.commit();
+            return res.json({ message: "Store deletion already in progress", store });
+        }
+
+        await connection.execute(
+            "UPDATE stores SET status = ?, deletion_started_at = ? WHERE id = ?",
+            ['Deleting', new Date(), storeId]
+        );
+
+        await connection.commit();
+
+        res.json({ message: "Store deletion initiated", store: { ...store, status: 'Deleting' } });
+
+        // Async deletion
+        (async () => {
+            try {
+                const command = `helm uninstall ${storeId} -n ${storeId} && kubectl delete namespace ${storeId}`;
+                const { stdout } = await execAsync(command);
+                console.log(`[${storeId}] Deleted successfully:`, stdout);
+
+                await pool.execute(
+                    "UPDATE stores SET status = ?, deleted_at = ? WHERE id = ?",
+                    ['Deleted', new Date(), storeId]
+                );
+            } catch (error) {
+                await pool.execute(
+                    "UPDATE stores SET status = ?, failure_reason = ? WHERE id = ?",
+                    ['Failed', `Deletion failed: ${error.message}`, storeId]
+                );
+                console.error(`[${storeId}] Deletion error:`, error.message);
+            }
+        })();
+
+    } catch (error) {
+        await connection.rollback();
+        console.error("Delete store error:", error);
+        res.status(500).json({ error: "Internal server error" });
+    } finally {
+        connection.release();
+    }
+});
+
+// Health check
+app.get("/health", async (req, res) => {
+    try {
+        await pool.execute('SELECT 1');
+        res.json({ status: "healthy", database: "connected" });
+    } catch (error) {
+        res.status(503).json({ status: "unhealthy", database: "disconnected" });
+    }
 });
 
 // Initialize and start server
 (async () => {
-    await loadStoreRegistry(); // 3️⃣ Load existing stores on startup
+    await initDatabase();
+
+    // Clean up old data every 5 minutes
+    setInterval(cleanupOldData, 5 * 60 * 1000);
 
     app.listen(3000, () => {
         console.log("Provisioning API running on port 3000");
-        console.log(`Max stores: ${CONFIG.MAX_STORES}`);
-        console.log(
-            `Provisioning timeout: ${CONFIG.PROVISIONING_TIMEOUT_MS / 1000}s`
-        );
+        console.log(`Max stores (global): ${CONFIG.MAX_STORES_GLOBAL}`);
+        console.log(`Max stores (per tenant): ${CONFIG.MAX_STORES_PER_TENANT}`);
+        console.log(`Max stores (per hour): ${CONFIG.MAX_STORES_PER_HOUR}`);
     });
 })();

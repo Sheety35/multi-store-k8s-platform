@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Multi-Store K8s Platform</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <header class="app-header">
+        <div class="container">
+            <h1>Multi-Store K8s Platform</h1>
+            <div class="user-info">
+                <span>Admin Console</span>
+            </div>
+        </div>
+    </header>
+
+    <main class="container">
+        <div class="actions-bar">
+            <h2>Your Stores</h2>
+            <button id="provision-btn" class="btn btn-primary">
+                Provision New Store
+            </button>
+        </div>
+
+        <div id="stores-list" class="stores-grid">
+            <!-- Stores will be injected here -->
+            <div class="loading-state">Loading stores...</div>
+        </div>
+    </main>
+
+    <div id="toast-container"></div>
+
+    <script src="app.js"></script>
+</body>
+</html>

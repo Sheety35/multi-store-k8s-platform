@@ -17,5 +17,8 @@ npm-debug.log*
 .DS_Store
 Thumbs.db
 
+# envtironment variables
+.env
+
 # storage 
 store-registry.json
